@@ -23,6 +23,13 @@
 #include "portal-private.h"
 #include "portal-enums.h"
 
+#include <unistd.h>
+#include <string.h>
+#include <fcntl.h>
+#include <errno.h>
+#include <sys/vfs.h>
+#include <stdio.h>
+
 /**
  * XdpPortal
  *
@@ -272,4 +279,172 @@ XdpPortal *
 xdp_portal_new (void)
 {
   return g_object_new (XDP_TYPE_PORTAL, NULL);
+}
+
+/* This function is copied from xdg-desktop-portal */
+int
+_xdp_parse_cgroup_file (FILE *f, gboolean *is_snap)
+{
+  ssize_t n;
+  g_autofree char *id = NULL;
+  g_autofree char *controller = NULL;
+  g_autofree char *cgroup = NULL;
+  size_t id_len = 0, controller_len = 0, cgroup_len = 0;
+
+  g_return_val_if_fail (f != NULL, -1);
+  g_return_val_if_fail (is_snap != NULL, -1);
+
+  *is_snap = FALSE;
+  do
+    {
+      n = getdelim (&id, &id_len, ':', f);
+      if (n == -1) break;
+      n = getdelim (&controller, &controller_len, ':', f);
+      if (n == -1) break;
+      n = getdelim (&cgroup, &cgroup_len, '\n', f);
+      if (n == -1) break;
+
+      /* Only consider the freezer, systemd group or unified cgroup
+       * hierarchies */
+      if ((!strcmp (controller, "freezer:") != 0 ||
+           !strcmp (controller, "name=systemd:") != 0 ||
+           !strcmp (controller, ":") != 0) &&
+          strstr (cgroup, "/snap.") != NULL)
+        {
+          *is_snap = TRUE;
+          break;
+        }
+    }
+  while (n >= 0);
+
+  if (n < 0 && !feof(f)) return -1;
+
+  return 0;
+}
+
+enum {
+  SNAP_STATE_UNSANDBOXED = 0,
+  SNAP_STATE_SANDBOXED,
+  SNAP_STATE_ERROR
+};
+
+/* This function is copied from xdg-desktop-portal pid_is_snap() */
+static gpointer
+get_under_snap (gpointer user_data)
+{
+  g_autofree char *cgroup_path = NULL;;
+  int fd;
+  FILE *f = NULL;
+  gboolean is_snap = FALSE;
+  int err = 0;
+  pid_t pid = getpid ();
+  GError **error = user_data;
+
+  cgroup_path = g_strdup_printf ("/proc/%u/cgroup", (guint) pid);
+  fd = open (cgroup_path, O_RDONLY | O_CLOEXEC | O_NOCTTY);
+  if (fd == -1)
+    {
+      err = errno;
+      goto end;
+    }
+
+  f = fdopen (fd, "r");
+  if (f == NULL)
+    {
+      err = errno;
+      goto end;
+    }
+
+  fd = -1; /* fd is now owned by f */
+
+  if (_xdp_parse_cgroup_file (f, &is_snap) == -1)
+    err = errno;
+
+  fclose (f);
+
+end:
+  /* Silence ENOENT, treating it as "not a snap" */
+  if (err != 0 && err != ENOENT)
+    {
+      g_set_error (error, G_IO_ERROR, g_io_error_from_errno (err),
+                   "Could not parse cgroup info for pid %u: %s", (guint) pid,
+                   g_strerror (err));
+      return GINT_TO_POINTER (SNAP_STATE_ERROR);
+    }
+  return is_snap ? GINT_TO_POINTER (SNAP_STATE_SANDBOXED) : GINT_TO_POINTER (SNAP_STATE_UNSANDBOXED);
+}
+
+static gpointer
+get_under_flatpak (gpointer user_data)
+{
+  return GINT_TO_POINTER (g_file_test ("/.flatpak-info", G_FILE_TEST_EXISTS));
+}
+
+/**
+ * xdp_portal_running_under_flatpak:
+ *
+ * If you are trying to determine whether to use portals, consider using
+ * xdp_portal_running_under_sandbox() instead.
+ *
+ * Returns: %TRUE if the current process is running under a Flatpak sandbox
+ */
+gboolean
+xdp_portal_running_under_flatpak (void)
+{
+  static GOnce under_flatpak = G_ONCE_INIT;
+
+  return GPOINTER_TO_INT (g_once (&under_flatpak, get_under_flatpak, NULL));
+}
+
+/**
+ * xdp_portal_running_under_snap:
+ * @error: return location for a #GError pointer
+ *
+ * If you are trying to determine whether to use portals, consider using
+ * xdp_portal_running_under_sandbox() instead.
+ *
+ * Returns: %TRUE if the current process is running under a Snap sandbox, or
+ *   %FALSE if either an error was encountered or the process is running
+ *   unsandboxed
+ */
+gboolean
+xdp_portal_running_under_snap (GError **error)
+{
+  static GOnce under_snap = G_ONCE_INIT;
+
+  /* In case an error is encountered, make sure it's set on all subsequent
+   * calls.
+   */
+  switch (GPOINTER_TO_INT (g_once (&under_snap, get_under_snap, NULL)))
+    {
+      case SNAP_STATE_UNSANDBOXED:
+        return FALSE;
+      case SNAP_STATE_SANDBOXED:
+        return TRUE;
+      case SNAP_STATE_ERROR:
+        if (error == NULL)
+          return FALSE;
+        else
+          return GPOINTER_TO_INT (get_under_snap (error)) == SNAP_STATE_SANDBOXED;
+      default:
+        g_assert_not_reached ();
+    }
+}
+
+/**
+ * xdp_portal_running_under_sandbox:
+ *
+ * This function tries to determine if the current process is running under a
+ * sandbox that requires the use of portals. If you need to check error
+ * conditions, consider using xdp_portal_running_under_snap() and
+ * xdp_portal_running_under_flatpak().
+ *
+ * Returns: %TRUE if the current process should use portals to access resources
+ *   on the host system, or %FALSE if either an error was encountered or the
+ *   process is running unsandboxed
+ */
+gboolean
+xdp_portal_running_under_sandbox (void)
+{
+  return xdp_portal_running_under_flatpak () || xdp_portal_running_under_snap (NULL);
 }
