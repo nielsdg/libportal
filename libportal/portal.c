@@ -374,12 +374,6 @@ end:
   return is_snap ? GINT_TO_POINTER (SNAP_STATE_SANDBOXED) : GINT_TO_POINTER (SNAP_STATE_UNSANDBOXED);
 }
 
-static gpointer
-get_under_flatpak (gpointer user_data)
-{
-  return GINT_TO_POINTER (g_file_test ("/.flatpak-info", G_FILE_TEST_EXISTS));
-}
-
 /**
  * xdp_portal_running_under_flatpak:
  *
@@ -391,9 +385,15 @@ get_under_flatpak (gpointer user_data)
 gboolean
 xdp_portal_running_under_flatpak (void)
 {
-  static GOnce under_flatpak = G_ONCE_INIT;
+  static gsize under_flatpak;
 
-  return GPOINTER_TO_INT (g_once (&under_flatpak, get_under_flatpak, NULL));
+  if (g_once_init_enter (&under_flatpak))
+    {
+      gboolean flatpak_info_exists = g_file_test ("/.flatpak-info", G_FILE_TEST_EXISTS);
+      g_once_init_leave (&under_flatpak, flatpak_info_exists);
+    }
+
+  return under_flatpak;
 }
 
 /**
