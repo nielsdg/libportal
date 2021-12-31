@@ -322,12 +322,6 @@ _xdp_parse_cgroup_file (FILE *f, gboolean *is_snap)
   return 0;
 }
 
-enum {
-  SNAP_STATE_UNSANDBOXED = 0,
-  SNAP_STATE_SANDBOXED,
-  SNAP_STATE_ERROR
-};
-
 /* This function is copied from xdg-desktop-portal pid_is_snap() */
 static gpointer
 get_under_snap (gpointer user_data)
@@ -369,9 +363,9 @@ end:
       g_set_error (error, G_IO_ERROR, g_io_error_from_errno (err),
                    "Could not parse cgroup info for pid %u: %s", (guint) pid,
                    g_strerror (err));
-      return GINT_TO_POINTER (SNAP_STATE_ERROR);
+      return GINT_TO_POINTER (FALSE);
     }
-  return is_snap ? GINT_TO_POINTER (SNAP_STATE_SANDBOXED) : GINT_TO_POINTER (SNAP_STATE_UNSANDBOXED);
+  return GINT_TO_POINTER (is_snap);
 }
 
 /**
@@ -410,25 +404,16 @@ xdp_portal_running_under_flatpak (void)
 gboolean
 xdp_portal_running_under_snap (GError **error)
 {
-  static GOnce under_snap = G_ONCE_INIT;
+  static GOnce under_snap_once = G_ONCE_INIT;
+  static GError *cached_error = NULL;
+  gboolean under_snap;
 
-  /* In case an error is encountered, make sure it's set on all subsequent
-   * calls.
-   */
-  switch (GPOINTER_TO_INT (g_once (&under_snap, get_under_snap, NULL)))
-    {
-      case SNAP_STATE_UNSANDBOXED:
-        return FALSE;
-      case SNAP_STATE_SANDBOXED:
-        return TRUE;
-      case SNAP_STATE_ERROR:
-        if (error == NULL)
-          return FALSE;
-        else
-          return GPOINTER_TO_INT (get_under_snap (error)) == SNAP_STATE_SANDBOXED;
-      default:
-        g_assert_not_reached ();
-    }
+  under_snap = GPOINTER_TO_INT (g_once (&under_snap_once, get_under_snap, &cached_error));
+
+  if (error != NULL && cached_error != NULL)
+    g_propagate_error (error, g_error_copy (cached_error));
+
+  return under_snap;
 }
 
 /**
